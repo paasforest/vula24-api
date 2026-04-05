@@ -8,6 +8,7 @@ const multer = require("multer");
 const { generateCustomerCode } = require("../lib/customer-code");
 const { uploadProofOfPayment } = require("../lib/cloudinary");
 const { sendSms, sendActivationSms } = require("../lib/sms");
+const { requireAdmin } = require("../lib/auth");
 
 const PORT = Number(process.env.PORT) || 3000;
 const NODE_ENV = process.env.NODE_ENV || "development";
@@ -246,7 +247,7 @@ app.post("/api/auth/locksmith/register", async (req, res) => {
 });
 
 // ─── Admin: Approve locksmith ────────────────────────────────────────────────
-app.post("/api/admin/approve/:id", async (req, res) => {
+app.post("/api/admin/approve/:id", requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     const { tier } = req.body || {};
@@ -307,7 +308,7 @@ app.post("/api/admin/approve/:id", async (req, res) => {
 });
 
 // ─── Admin: Activate locksmith after payment verified ────────────────────────
-app.post("/api/admin/activate/:id", async (req, res) => {
+app.post("/api/admin/activate/:id", requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     const { proofUrl } = req.body || {};
@@ -355,7 +356,7 @@ app.post("/api/admin/activate/:id", async (req, res) => {
 });
 
 // ─── Admin: Suspend locksmith ─────────────────────────────────────────────────
-app.post("/api/admin/suspend/:id", async (req, res) => {
+app.post("/api/admin/suspend/:id", requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
 
@@ -380,7 +381,7 @@ app.post("/api/admin/suspend/:id", async (req, res) => {
 });
 
 // ─── Admin: List pending locksmiths ──────────────────────────────────────────
-app.get("/api/admin/pending", async (_req, res) => {
+app.get("/api/admin/pending", requireAdmin, async (_req, res) => {
   try {
     const { rows } = await pool.query(
       `SELECT id, name, phone, email, account_type, business_name, services,
@@ -397,7 +398,7 @@ app.get("/api/admin/pending", async (_req, res) => {
 });
 
 // ─── Admin: List locksmiths awaiting payment proof ───────────────────────────
-app.get("/api/admin/payments", async (_req, res) => {
+app.get("/api/admin/payments", requireAdmin, async (_req, res) => {
   try {
     const { rows } = await pool.query(
       `SELECT id, name, phone, email, business_name, status,
@@ -414,7 +415,7 @@ app.get("/api/admin/payments", async (_req, res) => {
 });
 
 // ─── Admin: List active locksmiths ───────────────────────────────────────────
-app.get("/api/admin/active", async (_req, res) => {
+app.get("/api/admin/active", requireAdmin, async (_req, res) => {
   try {
     const { rows } = await pool.query(
       `SELECT id, name, phone, email, business_name, status,
