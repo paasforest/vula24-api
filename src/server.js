@@ -1,5 +1,6 @@
 require("dotenv").config();
 
+const cron = require("node-cron");
 const crypto = require("crypto");
 const express = require("express");
 const cors = require("cors");
@@ -63,6 +64,27 @@ function getBankDetails() {
 
 // Tier pricing
 const TIER_AMOUNTS = { Starter: 499, Pro: 899 };
+
+const LOCKSMITH_SERVICES = [
+  { value: "car_lockout", label: "Car lockout", urgency: "emergency" },
+  { value: "house_lockout", label: "House lockout", urgency: "emergency" },
+  { value: "office_lockout", label: "Office lockout", urgency: "emergency" },
+  { value: "lost_car_key", label: "Lost car key replacement", urgency: "urgent" },
+  { value: "car_key_duplication", label: "Car key duplication", urgency: "flexible" },
+  { value: "car_key_programming", label: "Car key programming", urgency: "urgent" },
+  { value: "broken_key_extraction", label: "Broken car key extraction", urgency: "urgent" },
+  { value: "house_key_replacement", label: "House key replacement", urgency: "urgent" },
+  { value: "house_key_duplication", label: "House key duplication", urgency: "flexible" },
+  { value: "lock_repair", label: "Lock repair", urgency: "flexible" },
+  { value: "lock_replacement", label: "Lock replacement", urgency: "flexible" },
+  { value: "lock_upgrade", label: "Lock upgrade", urgency: "flexible" },
+  { value: "safe_opening", label: "Safe opening", urgency: "urgent" },
+  { value: "gate_motor", label: "Gate motor repair", urgency: "flexible" },
+  { value: "access_control", label: "Access control", urgency: "flexible" },
+  { value: "padlock_removal", label: "Padlock removal", urgency: "urgent" },
+  { value: "garage_door", label: "Garage door", urgency: "flexible" },
+  { value: "ignition_repair", label: "Ignition repair", urgency: "urgent" },
+];
 
 const CITY_TO_PROVINCE = {
   Johannesburg: "GP",
@@ -174,6 +196,9 @@ async function ensureTables() {
     `ALTER TABLE locksmiths ADD COLUMN IF NOT EXISTS approved_by VARCHAR(255)`,
     `ALTER TABLE locksmiths ADD COLUMN IF NOT EXISTS reset_token VARCHAR(128)`,
     `ALTER TABLE locksmiths ADD COLUMN IF NOT EXISTS reset_token_expires TIMESTAMPTZ`,
+    `ALTER TABLE locksmiths ADD COLUMN IF NOT EXISTS amount_paid NUMERIC(10,2)`,
+    `ALTER TABLE locksmiths ADD COLUMN IF NOT EXISTS payment_date TIMESTAMPTZ`,
+    `ALTER TABLE locksmiths ADD COLUMN IF NOT EXISTS payment_reference VARCHAR(50)`,
   ];
   for (const sql of alterColumns) {
     await pool.query(sql + ";");
@@ -643,7 +668,7 @@ app.post("/api/admin/approve/:id", async (req, res) => {
 app.post("/api/admin/activate/:id", async (req, res) => {
   try {
     const { id } = req.params;
-    const { proofUrl } = req.body || {};
+    const { proofUrl, amountPaid: amountPaidRaw, activatedBy } = req.body || {};
 
     const { rows } = await pool.query(
       "SELECT * FROM locksmiths WHERE id = $1",
@@ -660,14 +685,39 @@ app.post("/api/admin/activate/:id", async (req, res) => {
       });
     }
 
+    const tierKey =
+      String(locksmith.tier || "Starter").trim().toLowerCase() === "pro"
+        ? "Pro"
+        : "Starter";
+    const expectedAmount =
+      TIER_AMOUNTS[locksmith.tier] ??
+      TIER_AMOUNTS[tierKey] ??
+      TIER_AMOUNTS.Starter;
+    const amountPaid = parseFloat(amountPaidRaw) || 0;
+    const amountMatches = amountPaid === expectedAmount;
+
+    const proofVal = proofUrl || locksmith.proof_of_payment;
+    const paymentRef =
+      typeof locksmith.customer_code === "string" && locksmith.customer_code.trim()
+        ? locksmith.customer_code.trim()
+        : `id-${id}`;
+    const approvedByVal =
+      typeof activatedBy === "string" && activatedBy.trim()
+        ? activatedBy.trim()
+        : "admin";
+
     await pool.query(
       `UPDATE locksmiths
        SET status = 'active',
            activation_date = NOW(),
            expiry_date = NOW() + INTERVAL '30 days',
-           proof_of_payment = $1
-       WHERE id = $2`,
-      [proofUrl || locksmith.proof_of_payment, id]
+           proof_of_payment = $1,
+           amount_paid = $2,
+           payment_date = NOW(),
+           payment_reference = $3,
+           approved_by = $4
+       WHERE id = $5`,
+      [proofVal, amountPaid, paymentRef, approvedByVal, id]
     );
 
     try {
@@ -680,7 +730,16 @@ app.post("/api/admin/activate/:id", async (req, res) => {
       console.error("[activate] SMS error (non-fatal):", smsErr.message);
     }
 
-    return res.status(200).json({ ok: true, message: "Account activated" });
+    return res.status(200).json({
+      ok: true,
+      message: "Account activated",
+      amountMatches,
+      expectedAmount,
+      amountPaid,
+      warning: !amountMatches
+        ? `Amount paid (R${amountPaid}) does not match expected (R${expectedAmount})`
+        : null,
+    });
   } catch (e) {
     console.error("[POST /api/admin/activate/:id]", e);
     return res.status(500).json({ error: "Could not activate locksmith." });
@@ -762,6 +821,184 @@ app.get("/api/admin/active", async (_req, res) => {
     console.error("[GET /api/admin/active]", e);
     return res.status(500).json({ error: "Could not fetch active locksmiths." });
   }
+});
+
+// ─── Admin: All providers (filters + search) ─────────────────────────────────
+app.get("/api/admin/providers", async (req, res) => {
+  try {
+    const { status, province, tier, search } = req.query || {};
+    const params = [];
+    let i = 1;
+    let sql = `
+      SELECT
+        id,
+        name,
+        phone,
+        email,
+        customer_code,
+        tier,
+        status,
+        province,
+        coverage_areas,
+        services,
+        base_address,
+        activation_date,
+        expiry_date,
+        amount_paid,
+        payment_date,
+        created_at,
+        CASE
+          WHEN expiry_date IS NOT NULL
+          THEN CEIL(EXTRACT(EPOCH FROM (expiry_date - NOW())) / 86400)
+          ELSE NULL
+        END AS days_remaining
+      FROM locksmiths
+      WHERE 1=1`;
+
+    if (status && String(status).trim()) {
+      sql += ` AND LOWER(status) = LOWER($${i++})`;
+      params.push(String(status).trim());
+    }
+    if (province && String(province).trim()) {
+      sql += ` AND UPPER(province) = UPPER($${i++})`;
+      params.push(String(province).trim());
+    }
+    if (tier && String(tier).trim()) {
+      sql += ` AND LOWER(tier) = LOWER($${i++})`;
+      params.push(String(tier).trim());
+    }
+    if (search && String(search).trim()) {
+      const q = `%${String(search).trim()}%`;
+      sql += ` AND (name ILIKE $${i} OR phone ILIKE $${i})`;
+      params.push(q);
+      i += 1;
+    }
+
+    sql += ` ORDER BY created_at DESC`;
+
+    const { rows } = await pool.query(sql, params);
+    return res.status(200).json({
+      ok: true,
+      providers: rows,
+      total: rows.length,
+    });
+  } catch (e) {
+    console.error("[GET /api/admin/providers]", e);
+    return res.status(500).json({ error: "Could not fetch providers." });
+  }
+});
+
+// ─── Admin: Finance summary + payment rows ───────────────────────────────────
+app.get("/api/admin/finance", async (_req, res) => {
+  try {
+    const { rows: totalRevRows } = await pool.query(
+      `SELECT COALESCE(SUM(amount_paid), 0)::numeric AS sum
+       FROM locksmiths
+       WHERE LOWER(status) IN ('active', 'expired')
+         AND amount_paid IS NOT NULL`
+    );
+    const { rows: thisMonthRows } = await pool.query(
+      `SELECT COALESCE(SUM(amount_paid), 0)::numeric AS sum
+       FROM locksmiths
+       WHERE payment_date IS NOT NULL
+         AND payment_date >= date_trunc('month', NOW())`
+    );
+    const { rows: lastMonthRows } = await pool.query(
+      `SELECT COALESCE(SUM(amount_paid), 0)::numeric AS sum
+       FROM locksmiths
+       WHERE payment_date IS NOT NULL
+         AND payment_date >= date_trunc('month', NOW() - INTERVAL '1 month')
+         AND payment_date < date_trunc('month', NOW())`
+    );
+    const { rows: activeCountRows } = await pool.query(
+      `SELECT COUNT(*)::int AS c FROM locksmiths WHERE LOWER(status) = 'active'`
+    );
+    const { rows: starterCountRows } = await pool.query(
+      `SELECT COUNT(*)::int AS c
+       FROM locksmiths
+       WHERE LOWER(status) = 'active' AND LOWER(tier) = 'starter'`
+    );
+    const { rows: proCountRows } = await pool.query(
+      `SELECT COUNT(*)::int AS c
+       FROM locksmiths
+       WHERE LOWER(status) = 'active' AND LOWER(tier) = 'pro'`
+    );
+    const { rows: pendingCountRows } = await pool.query(
+      `SELECT COUNT(*)::int AS c FROM locksmiths WHERE LOWER(status) = 'pending'`
+    );
+    const { rows: expiredCountRows } = await pool.query(
+      `SELECT COUNT(*)::int AS c FROM locksmiths WHERE LOWER(status) = 'expired'`
+    );
+    const { rows: suspendedCountRows } = await pool.query(
+      `SELECT COUNT(*)::int AS c FROM locksmiths WHERE LOWER(status) = 'suspended'`
+    );
+
+    const activeCount = activeCountRows[0]?.c ?? 0;
+    const starterCount = starterCountRows[0]?.c ?? 0;
+    const proCount = proCountRows[0]?.c ?? 0;
+    const projectedNextMonth = starterCount * 499 + proCount * 899;
+
+    const { rows: payRows } = await pool.query(
+      `SELECT
+         id,
+         customer_code,
+         name,
+         phone,
+         tier,
+         amount_paid,
+         payment_date,
+         activation_date,
+         expiry_date,
+         status,
+         CASE
+           WHEN expiry_date IS NOT NULL
+           THEN CEIL(EXTRACT(EPOCH FROM (expiry_date - NOW())) / 86400)
+           ELSE NULL
+         END AS days_remaining
+       FROM locksmiths
+       ORDER BY payment_date DESC NULLS LAST, created_at DESC
+       LIMIT 500`
+    );
+
+    const payments = payRows.map((r) => ({
+      id: r.id,
+      customerCode: r.customer_code,
+      name: r.name,
+      phone: r.phone,
+      tier: r.tier,
+      amountPaid: r.amount_paid != null ? Number(r.amount_paid) : null,
+      paymentDate: r.payment_date,
+      activationDate: r.activation_date,
+      expiryDate: r.expiry_date,
+      status: r.status,
+      daysRemaining: r.days_remaining != null ? Number(r.days_remaining) : null,
+    }));
+
+    return res.status(200).json({
+      ok: true,
+      summary: {
+        totalRevenue: Number(totalRevRows[0]?.sum ?? 0),
+        thisMonthRevenue: Number(thisMonthRows[0]?.sum ?? 0),
+        lastMonthRevenue: Number(lastMonthRows[0]?.sum ?? 0),
+        activeCount,
+        starterCount,
+        proCount,
+        pendingCount: pendingCountRows[0]?.c ?? 0,
+        expiredCount: expiredCountRows[0]?.c ?? 0,
+        suspendedCount: suspendedCountRows[0]?.c ?? 0,
+        projectedNextMonth,
+      },
+      payments,
+    });
+  } catch (e) {
+    console.error("[GET /api/admin/finance]", e);
+    return res.status(500).json({ error: "Could not load finance data." });
+  }
+});
+
+// ─── Public: canonical service list (forms) ──────────────────────────────────
+app.get("/api/services", (_req, res) => {
+  return res.status(200).json({ ok: true, services: LOCKSMITH_SERVICES });
 });
 
 // ─── Locksmith: Upload proof of payment ──────────────────────────────────────
@@ -1097,6 +1334,80 @@ async function main() {
   }
 
   await ensureTables();
+
+  cron.schedule(
+    "0 8 * * *",
+    async () => {
+      console.log("[CRON] Running expiry check...");
+      try {
+        const appUrl = (
+          process.env.NEXT_PUBLIC_APP_URL || "https://vula24.co.za"
+        ).replace(/\/$/, "");
+        const bank = getBankDetails();
+        let warned = 0;
+        let expired = 0;
+
+        const { rows: warnRows } = await pool.query(
+          `SELECT id, phone, customer_code, tier, expiry_date
+       FROM locksmiths
+       WHERE LOWER(status) = 'active'
+         AND expiry_date IS NOT NULL
+         AND expiry_date > NOW()
+         AND expiry_date <= NOW() + INTERVAL '3 days'`
+        );
+
+        for (const lm of warnRows) {
+          const d = new Date(lm.expiry_date);
+          const days = Math.max(
+            1,
+            Math.ceil((d.getTime() - Date.now()) / 86400000)
+          );
+          const amt = TIER_AMOUNTS[lm.tier] ?? TIER_AMOUNTS.Starter;
+          const msg =
+            `Vula24: Your subscription expires in ${days} days.\n` +
+            `Renew using reference: ${lm.customer_code}\n` +
+            `Deposit R${amt} to:\n` +
+            `Bank: ${bank.bankName}\n` +
+            `Acc: ${bank.accountNumber}\n` +
+            `Ref: ${lm.customer_code}\n` +
+            `Upload proof: ${appUrl}/locksmith/payment`;
+          await sendSms(lm.phone, msg, `cron-warn-${lm.id}`);
+          warned++;
+        }
+
+        const { rows: expRows } = await pool.query(
+          `SELECT id, phone, customer_code, tier
+       FROM locksmiths
+       WHERE LOWER(status) = 'active'
+         AND expiry_date IS NOT NULL
+         AND expiry_date < NOW()`
+        );
+
+        for (const lm of expRows) {
+          await pool.query(`UPDATE locksmiths SET status = 'expired' WHERE id = $1`, [
+            lm.id,
+          ]);
+          const amt = TIER_AMOUNTS[lm.tier] ?? TIER_AMOUNTS.Starter;
+          const msg =
+            `Vula24: Your subscription has expired.\n` +
+            `To reactivate deposit R${amt}\n` +
+            `Reference: ${lm.customer_code}\n` +
+            `Upload proof: ${appUrl}/locksmith/payment`;
+          await sendSms(lm.phone, msg, `cron-exp-${lm.id}`);
+          expired++;
+        }
+
+        console.log(`[CRON] Done. Warned: ${warned}, Expired: ${expired}`);
+      } catch (e) {
+        console.error("[CRON] Expiry check failed:", e);
+      }
+    },
+    {
+      timezone: "Africa/Johannesburg",
+    }
+  );
+
+  console.log("[CRON] Expiry check scheduled: 08:00 Africa/Johannesburg daily");
 
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`vula24-api listening on ${PORT} (${NODE_ENV})`);
