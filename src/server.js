@@ -46,8 +46,12 @@ async function ensureTables() {
       password_hash TEXT NOT NULL,
       account_type VARCHAR(50) NOT NULL,
       business_name VARCHAR(255) NOT NULL,
+      services JSONB NOT NULL DEFAULT '[]'::jsonb,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
+  `);
+  await pool.query(`
+    ALTER TABLE locksmiths ADD COLUMN IF NOT EXISTS services JSONB NOT NULL DEFAULT '[]'::jsonb;
   `);
 }
 
@@ -109,7 +113,7 @@ app.post("/api/jobs/website/request", async (req, res) => {
 
 app.post("/api/auth/locksmith/register", async (req, res) => {
   try {
-    const { name, phone, email, password, accountType, businessName } =
+    const { name, phone, email, password, accountType, businessName, services } =
       req.body || {};
 
     if (!name || typeof name !== "string" || !name.trim()) {
@@ -132,12 +136,23 @@ app.post("/api/auth/locksmith/register", async (req, res) => {
     if (!businessName || typeof businessName !== "string" || !businessName.trim()) {
       return res.status(400).json({ error: "businessName is required" });
     }
+    if (!Array.isArray(services) || services.length === 0) {
+      return res.status(400).json({
+        error: "services must be a non-empty array of service names",
+      });
+    }
+    const servicesClean = services
+      .filter((s) => typeof s === "string" && s.trim().length > 0)
+      .map((s) => s.trim());
+    if (servicesClean.length === 0) {
+      return res.status(400).json({ error: "At least one valid service is required" });
+    }
 
     const password_hash = await bcrypt.hash(password, 12);
 
     const result = await pool.query(
-      `INSERT INTO locksmiths (name, phone, email, password_hash, account_type, business_name)
-       VALUES ($1, $2, $3, $4, $5, $6)
+      `INSERT INTO locksmiths (name, phone, email, password_hash, account_type, business_name, services)
+       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
        RETURNING id, created_at`,
       [
         name.trim(),
@@ -146,6 +161,7 @@ app.post("/api/auth/locksmith/register", async (req, res) => {
         password_hash,
         accountType.trim(),
         businessName.trim(),
+        JSON.stringify(servicesClean),
       ]
     );
 
