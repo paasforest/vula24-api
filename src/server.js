@@ -420,12 +420,23 @@ app.post("/api/auth/locksmith/register", async (req, res) => {
       return res.status(400).json({ error: "At least one valid service is required" });
     }
 
+    const province = req.body.province ?? "GP";
+    const coverageAreas = Array.isArray(req.body.coverageAreas)
+      ? req.body.coverageAreas
+      : [];
+    const baseAddress = req.body.baseAddress ?? "";
+
     const password_hash = await bcrypt.hash(password, 12);
 
     const result = await pool.query(
-      `INSERT INTO locksmiths (name, phone, email, password_hash, account_type, business_name, services)
-       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
-       RETURNING id, created_at`,
+      `INSERT INTO locksmiths (name, phone, email, password_hash,
+account_type, business_name, services,
+province, coverage_areas, base_address)
+VALUES (
+  $1, $2, $3, $4, $5, $6,
+  $7::jsonb, $8, $9::text[], $10
+)
+RETURNING id, created_at`,
       [
         name.trim(),
         phone.trim(),
@@ -434,6 +445,11 @@ app.post("/api/auth/locksmith/register", async (req, res) => {
         accountType.trim(),
         businessName.trim(),
         JSON.stringify(servicesClean),
+        (province ?? "GP").trim().toUpperCase(),
+        coverageAreas
+          .filter((s) => typeof s === "string" && s.trim().length > 0)
+          .map((s) => s.trim()),
+        (baseAddress ?? "").trim() || null,
       ]
     );
 
