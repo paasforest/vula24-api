@@ -1,5 +1,6 @@
 require("dotenv").config();
 
+const crypto = require("crypto");
 const express = require("express");
 const cors = require("cors");
 const bcrypt = require("bcryptjs");
@@ -12,6 +13,8 @@ const {
   signLocksmithToken,
   verifyLocksmithToken,
 } = require("../lib/locksmith-auth");
+const { findLocksmithByEmailOrPhone } = require("../lib/locksmith-lookup");
+const { sendPasswordResetEmail } = require("../lib/email-resend");
 
 const PORT = Number(process.env.PORT) || 3000;
 const NODE_ENV = process.env.NODE_ENV || "development";
@@ -112,6 +115,8 @@ async function ensureTables() {
     `ALTER TABLE locksmiths ADD COLUMN IF NOT EXISTS base_address TEXT`,
     `ALTER TABLE locksmiths ADD COLUMN IF NOT EXISTS approved_at TIMESTAMPTZ`,
     `ALTER TABLE locksmiths ADD COLUMN IF NOT EXISTS approved_by VARCHAR(255)`,
+    `ALTER TABLE locksmiths ADD COLUMN IF NOT EXISTS reset_token VARCHAR(128)`,
+    `ALTER TABLE locksmiths ADD COLUMN IF NOT EXISTS reset_token_expires TIMESTAMPTZ`,
   ];
   for (const sql of alterColumns) {
     await pool.query(sql + ";");
@@ -297,6 +302,122 @@ app.post("/api/auth/locksmith/login", async (req, res) => {
   } catch (e) {
     console.error("[POST /api/auth/locksmith/login]", e);
     return res.status(500).json({ error: "Could not sign in." });
+  }
+});
+
+const FORGOT_PASSWORD_GENERIC = {
+  ok: true,
+  message:
+    "If an account exists for that email or phone, we sent reset instructions by SMS and/or email.",
+};
+
+app.post("/api/auth/locksmith/forgot-password", async (req, res) => {
+  try {
+    const { email, phone } = req.body || {};
+    const raw =
+      typeof email === "string" && email.trim()
+        ? email.trim()
+        : typeof phone === "string" && phone.trim()
+          ? phone.trim()
+          : "";
+    if (!raw) {
+      return res
+        .status(400)
+        .json({ error: "Enter your email or phone number." });
+    }
+
+    const row = await findLocksmithByEmailOrPhone(pool, raw);
+    if (!row) {
+      return res.status(200).json(FORGOT_PASSWORD_GENERIC);
+    }
+
+    const token = crypto.randomBytes(32).toString("hex");
+    const expires = new Date(Date.now() + 60 * 60 * 1000);
+
+    await pool.query(
+      `UPDATE locksmiths SET reset_token = $1, reset_token_expires = $2 WHERE id = $3`,
+      [token, expires, row.id]
+    );
+
+    const appUrl = (
+      process.env.NEXT_PUBLIC_APP_URL || "https://vula24.co.za"
+    ).replace(/\/$/, "");
+    const resetUrl = `${appUrl}/locksmith/reset-password?token=${encodeURIComponent(token)}`;
+
+    let smsSent = false;
+    let emailSent = false;
+    try {
+      smsSent = await sendSms(
+        row.phone,
+        `Vula24: reset your password (valid 1 hour):\n${resetUrl}`,
+        `pwd-reset-${row.id}`
+      );
+    } catch (smsErr) {
+      console.error("[forgot-password] SMS error:", smsErr.message);
+    }
+
+    try {
+      const em = (row.email || "").trim();
+      if (em) {
+        emailSent = await sendPasswordResetEmail(em, resetUrl);
+      }
+    } catch (emailErr) {
+      console.error("[forgot-password] Email error:", emailErr.message);
+    }
+
+    if (!smsSent && !emailSent) {
+      await pool.query(
+        `UPDATE locksmiths SET reset_token = NULL, reset_token_expires = NULL WHERE id = $1`,
+        [row.id]
+      );
+      return res.status(503).json({
+        error:
+          "Could not send reset instructions. Try again later or contact support.",
+      });
+    }
+
+    return res.status(200).json(FORGOT_PASSWORD_GENERIC);
+  } catch (e) {
+    console.error("[POST /api/auth/locksmith/forgot-password]", e);
+    return res.status(500).json({ error: "Could not process request." });
+  }
+});
+
+app.post("/api/auth/locksmith/reset-password", async (req, res) => {
+  try {
+    const { token, password } = req.body || {};
+    if (!token || typeof token !== "string" || !token.trim()) {
+      return res.status(400).json({ error: "Reset token is required." });
+    }
+    if (!password || typeof password !== "string" || password.length < 6) {
+      return res.status(400).json({
+        error: "Password must be at least 6 characters.",
+      });
+    }
+
+    const { rows } = await pool.query(
+      `SELECT id FROM locksmiths WHERE reset_token = $1 AND reset_token_expires > NOW()`,
+      [token.trim()]
+    );
+    if (rows.length === 0) {
+      return res.status(400).json({
+        error: "Invalid or expired link. Request a new password reset.",
+      });
+    }
+
+    const hash = await bcrypt.hash(password, 12);
+    await pool.query(
+      `UPDATE locksmiths SET password_hash = $1, reset_token = NULL, reset_token_expires = NULL WHERE id = $2`,
+      [hash, rows[0].id]
+    );
+
+    return res.status(200).json({
+      ok: true,
+      message: "Password updated. You can sign in now.",
+    });
+  } catch (e) {
+    console.error("[POST /api/auth/locksmith/reset-password]", e);
+    return res.status(500).json({ error: "Could not reset password." });
   }
 });
 
