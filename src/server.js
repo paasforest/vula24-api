@@ -8,6 +8,10 @@ const multer = require("multer");
 const { generateCustomerCode } = require("../lib/customer-code");
 const { uploadProofOfPayment } = require("../lib/cloudinary");
 const { sendSms, sendActivationSms, isSmsConfigured } = require("../lib/sms");
+const {
+  signLocksmithToken,
+  verifyLocksmithToken,
+} = require("../lib/locksmith-auth");
 
 const PORT = Number(process.env.PORT) || 3000;
 const NODE_ENV = process.env.NODE_ENV || "development";
@@ -122,7 +126,13 @@ async function ensureTables() {
 }
 
 const app = express();
-app.use(cors({ origin: corsOrigin() }));
+app.use(
+  cors({
+    origin: corsOrigin(),
+    credentials: false,
+    allowedHeaders: ["Content-Type", "Authorization"],
+  })
+);
 app.use(express.json());
 
 app.get("/health", (_req, res) => {
@@ -249,6 +259,44 @@ app.post("/api/auth/locksmith/register", async (req, res) => {
     }
     console.error("[POST /api/auth/locksmith/register]", e);
     return res.status(500).json({ error: "Could not register locksmith." });
+  }
+});
+
+app.post("/api/auth/locksmith/login", async (req, res) => {
+  try {
+    const { email, password } = req.body || {};
+    if (!email || typeof email !== "string" || !email.trim()) {
+      return res.status(400).json({ error: "email is required" });
+    }
+    if (!password || typeof password !== "string") {
+      return res.status(400).json({ error: "password is required" });
+    }
+    if (!process.env.JWT_SECRET?.trim()) {
+      return res.status(500).json({
+        error: "Login is not configured (JWT_SECRET missing on server).",
+      });
+    }
+
+    const { rows } = await pool.query(
+      "SELECT * FROM locksmiths WHERE LOWER(email) = LOWER($1)",
+      [email.trim()]
+    );
+    if (rows.length === 0) {
+      return res.status(401).json({ error: "Invalid email or password." });
+    }
+
+    const locksmith = rows[0];
+    const match = await bcrypt.compare(password, locksmith.password_hash);
+    if (!match) {
+      return res.status(401).json({ error: "Invalid email or password." });
+    }
+
+    const token = signLocksmithToken(locksmith.id);
+    delete locksmith.password_hash;
+    return res.status(200).json({ ok: true, token, locksmith });
+  } catch (e) {
+    console.error("[POST /api/auth/locksmith/login]", e);
+    return res.status(500).json({ error: "Could not sign in." });
   }
 });
 
@@ -514,6 +562,34 @@ app.post(
   }
 );
 
+// ─── Locksmith: Session (email/password login) ─────────────────────────────
+app.get("/api/locksmith/me", async (req, res) => {
+  try {
+    const id = verifyLocksmithToken(req.headers.authorization);
+    if (!id) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+
+    const { rows } = await pool.query(
+      `SELECT id, name, phone, email, status, tier, customer_code,
+              activation_date, expiry_date, proof_of_payment,
+              coverage_areas, services, base_address,
+              EXTRACT(EPOCH FROM (expiry_date - NOW())) / 86400 AS days_remaining
+       FROM locksmiths
+       WHERE id = $1`,
+      [id]
+    );
+    if (rows.length === 0) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+
+    return res.status(200).json({ ok: true, ...rows[0] });
+  } catch (e) {
+    console.error("[GET /api/locksmith/me]", e);
+    return res.status(500).json({ error: "Could not load account." });
+  }
+});
+
 // ─── Locksmith: Dashboard ─────────────────────────────────────────────────────
 app.get("/api/locksmith/dashboard/:code", async (req, res) => {
   try {
@@ -522,7 +598,8 @@ app.get("/api/locksmith/dashboard/:code", async (req, res) => {
     const { rows } = await pool.query(
       `SELECT id, name, phone, email, status, tier, customer_code,
               activation_date, expiry_date, proof_of_payment,
-              coverage_areas, services, base_address
+              coverage_areas, services, base_address,
+              EXTRACT(EPOCH FROM (expiry_date - NOW())) / 86400 AS days_remaining
        FROM locksmiths
        WHERE customer_code = $1`,
       [code]
