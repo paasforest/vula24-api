@@ -7,7 +7,7 @@ const { Pool } = require("pg");
 const multer = require("multer");
 const { generateCustomerCode } = require("../lib/customer-code");
 const { uploadProofOfPayment } = require("../lib/cloudinary");
-const { sendSms, sendActivationSms } = require("../lib/sms");
+const { sendSms, sendActivationSms, isSmsConfigured } = require("../lib/sms");
 
 const PORT = Number(process.env.PORT) || 3000;
 const NODE_ENV = process.env.NODE_ENV || "development";
@@ -126,7 +126,14 @@ app.use(cors({ origin: corsOrigin() }));
 app.use(express.json());
 
 app.get("/health", (_req, res) => {
-  res.status(200).json({ ok: true, env: NODE_ENV });
+  res.status(200).json({
+    ok: true,
+    env: NODE_ENV,
+    sms: {
+      provider: "smsportal",
+      configured: isSmsConfigured(),
+    },
+  });
 });
 
 app.post("/api/jobs/website/request", async (req, res) => {
@@ -296,9 +303,7 @@ app.post("/api/admin/approve/:id", async (req, res) => {
     return res.status(200).json({
       ok: true,
       customer_code: customerCode,
-      message: smsSent
-        ? "SMS sent to locksmith"
-        : "Approved (SMS delivery failed — check logs)",
+      smsSent,
     });
   } catch (e) {
     console.error("[POST /api/admin/approve/:id]", e);
@@ -509,7 +514,8 @@ app.get("/api/locksmith/dashboard/:code", async (req, res) => {
       return res.status(404).json({ error: "Locksmith not found" });
     }
 
-    return res.status(200).json({ ok: true, locksmith: rows[0] });
+    const row = rows[0];
+    return res.status(200).json({ ok: true, ...row });
   } catch (e) {
     console.error("[GET /api/locksmith/dashboard/:code]", e);
     return res.status(500).json({ error: "Could not fetch dashboard." });

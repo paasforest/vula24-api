@@ -5,6 +5,7 @@
   "main": "src/server.js",
   "scripts": {
     "start": "node src/server.js",
+    "sms:test": "node scripts/test-sms.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
