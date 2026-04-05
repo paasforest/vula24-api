@@ -8,7 +8,15 @@ const { Pool } = require("pg");
 const multer = require("multer");
 const { generateCustomerCode } = require("../lib/customer-code");
 const { uploadProofOfPayment } = require("../lib/cloudinary");
-const { sendSms, sendActivationSms, isSmsConfigured } = require("../lib/sms");
+const {
+  sendSms,
+  sendActivationSms,
+  isSmsConfigured,
+  sendJobClaimed,
+  sendJobTaken,
+  normalizeDestinationMsisdn,
+} = require("../lib/sms");
+const { dispatchJob } = require("../lib/matching");
 const {
   signLocksmithToken,
   verifyLocksmithToken,
@@ -55,6 +63,55 @@ function getBankDetails() {
 
 // Tier pricing
 const TIER_AMOUNTS = { Starter: 499, Pro: 899 };
+
+const CITY_TO_PROVINCE = {
+  Johannesburg: "GP",
+  Pretoria: "GP",
+  Sandton: "GP",
+  Midrand: "GP",
+  Soweto: "GP",
+  Centurion: "GP",
+  Randburg: "GP",
+  Roodepoort: "GP",
+  "Cape Town": "WC",
+  Worcester: "WC",
+  Stellenbosch: "WC",
+  Paarl: "WC",
+  Franschhoek: "WC",
+  "Somerset West": "WC",
+  Bellville: "WC",
+  George: "WC",
+};
+
+function cityToProvince(city) {
+  const c = (city || "").trim();
+  return CITY_TO_PROVINCE[c] || "GP";
+}
+
+function generateJobCode() {
+  return `JB${Date.now()}${String(Math.floor(Math.random() * 900) + 100)}`;
+}
+
+async function createJobAndDispatch(pool, payload) {
+  const {
+    service,
+    urgency,
+    customerName,
+    customerPhone,
+    suburb,
+    province,
+  } = payload;
+  const jobCode = generateJobCode();
+  const { rows } = await pool.query(
+    `INSERT INTO jobs (job_code, service, urgency, customer_name, customer_phone, suburb, province, status)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending')
+     RETURNING id`,
+    [jobCode, service, urgency, customerName, customerPhone, suburb, province]
+  );
+  const jobId = rows[0].id;
+  await dispatchJob(pool, jobId);
+  return { jobCode, jobId };
+}
 
 function corsOrigin() {
   const raw = process.env.CORS_ORIGIN;
@@ -128,6 +185,40 @@ async function ensureTables() {
     ON locksmiths (customer_code)
     WHERE customer_code IS NOT NULL;
   `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS jobs (
+      id SERIAL PRIMARY KEY,
+      job_code VARCHAR(32) UNIQUE NOT NULL,
+      service VARCHAR(100) NOT NULL,
+      urgency VARCHAR(20) NOT NULL,
+      customer_name VARCHAR(200),
+      customer_phone VARCHAR(20) NOT NULL,
+      suburb VARCHAR(100) NOT NULL,
+      province VARCHAR(5) NOT NULL,
+      status VARCHAR(20) DEFAULT 'pending',
+      claimed_by VARCHAR(30),
+      claimed_at TIMESTAMPTZ,
+      completed_at TIMESTAMPTZ,
+      notified_count INTEGER DEFAULT 0,
+      notified_ids INTEGER[] DEFAULT '{}',
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS sms_logs (
+      id SERIAL PRIMARY KEY,
+      recipient VARCHAR(20) NOT NULL,
+      message TEXT NOT NULL,
+      job_id INTEGER,
+      status VARCHAR(20) DEFAULT 'sent',
+      provider VARCHAR(50) DEFAULT 'smsportal',
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
+  await pool.query(
+    `ALTER TABLE customer_leads ADD COLUMN IF NOT EXISTS suburb VARCHAR(255);`
+  );
 }
 
 const app = express();
@@ -135,7 +226,7 @@ app.use(
   cors({
     origin: corsOrigin(),
     credentials: false,
-    allowedHeaders: ["Content-Type", "Authorization"],
+    allowedHeaders: ["Content-Type", "Authorization", "x-cron-secret"],
   })
 );
 app.use(express.json());
@@ -153,7 +244,8 @@ app.get("/health", (_req, res) => {
 
 app.post("/api/jobs/website/request", async (req, res) => {
   try {
-    const { name, phone, city, serviceType, urgency, notes } = req.body || {};
+    const { name, phone, city, suburb, serviceType, urgency, notes } =
+      req.body || {};
 
     if (!name || typeof name !== "string" || !name.trim()) {
       return res.status(400).json({ error: "name is required" });
@@ -164,6 +256,9 @@ app.post("/api/jobs/website/request", async (req, res) => {
     if (!city || typeof city !== "string" || !city.trim()) {
       return res.status(400).json({ error: "city is required" });
     }
+    if (!suburb || typeof suburb !== "string" || !suburb.trim()) {
+      return res.status(400).json({ error: "suburb is required" });
+    }
     if (!serviceType || typeof serviceType !== "string" || !serviceType.trim()) {
       return res.status(400).json({ error: "serviceType is required" });
     }
@@ -173,29 +268,93 @@ app.post("/api/jobs/website/request", async (req, res) => {
 
     const notesVal =
       notes != null && typeof notes === "string" ? notes.trim() : null;
+    const province = cityToProvince(city.trim());
 
     const result = await pool.query(
-      `INSERT INTO customer_leads (name, phone, city, service_type, urgency, notes)
-       VALUES ($1, $2, $3, $4, $5, $6)
+      `INSERT INTO customer_leads (name, phone, city, suburb, service_type, urgency, notes)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
        RETURNING id, created_at`,
       [
         name.trim(),
         phone.trim(),
         city.trim(),
+        suburb.trim(),
         serviceType.trim(),
         urgency.trim(),
         notesVal,
       ]
     );
 
+    let jobCode = null;
+    try {
+      const job = await createJobAndDispatch(pool, {
+        service: serviceType.trim(),
+        urgency: urgency.trim(),
+        customerName: name.trim(),
+        customerPhone: phone.trim(),
+        suburb: suburb.trim(),
+        province,
+      });
+      jobCode = job.jobCode;
+    } catch (jobErr) {
+      console.error("[POST /api/jobs/website/request] job dispatch:", jobErr);
+    }
+
     return res.status(201).json({
       ok: true,
       id: String(result.rows[0].id),
       createdAt: result.rows[0].created_at,
+      jobCode,
     });
   } catch (e) {
     console.error("[POST /api/jobs/website/request]", e);
     return res.status(500).json({ error: "Could not save lead." });
+  }
+});
+
+app.post("/api/jobs/create", async (req, res) => {
+  try {
+    const {
+      service,
+      urgency,
+      customerName,
+      customerPhone,
+      suburb,
+      province,
+    } = req.body || {};
+
+    if (!service || typeof service !== "string" || !service.trim()) {
+      return res.status(400).json({ error: "service is required" });
+    }
+    if (!urgency || typeof urgency !== "string" || !urgency.trim()) {
+      return res.status(400).json({ error: "urgency is required" });
+    }
+    if (!customerName || typeof customerName !== "string" || !customerName.trim()) {
+      return res.status(400).json({ error: "customerName is required" });
+    }
+    if (!customerPhone || typeof customerPhone !== "string" || !customerPhone.trim()) {
+      return res.status(400).json({ error: "customerPhone is required" });
+    }
+    if (!suburb || typeof suburb !== "string" || !suburb.trim()) {
+      return res.status(400).json({ error: "suburb is required" });
+    }
+    if (!province || typeof province !== "string" || !province.trim()) {
+      return res.status(400).json({ error: "province is required" });
+    }
+
+    const { jobCode } = await createJobAndDispatch(pool, {
+      service: service.trim(),
+      urgency: urgency.trim(),
+      customerName: customerName.trim(),
+      customerPhone: customerPhone.trim(),
+      suburb: suburb.trim(),
+      province: province.trim().toUpperCase().slice(0, 5),
+    });
+
+    return res.status(201).json({ ok: true, jobCode });
+  } catch (e) {
+    console.error("[POST /api/jobs/create]", e);
+    return res.status(500).json({ error: "Could not create job." });
   }
 });
 
@@ -734,6 +893,195 @@ app.get("/api/locksmith/dashboard/:code", async (req, res) => {
   } catch (e) {
     console.error("[GET /api/locksmith/dashboard/:code]", e);
     return res.status(500).json({ error: "Could not fetch dashboard." });
+  }
+});
+
+// ─── SMS incoming (SMSPortal webhook) ────────────────────────────────────────
+app.post("/api/sms/incoming", async (req, res) => {
+  try {
+    const body = req.body || {};
+    const incomingData =
+      body.incomingData ?? body.data ?? body.message ?? body.text ?? "";
+    const sourcePhoneNumber =
+      body.sourcePhoneNumber ?? body.from ?? body.phone ?? body.mobile ?? "";
+
+    const raw = String(incomingData).trim();
+    if (!raw.toUpperCase().startsWith("CLAIM#")) {
+      return res.status(200).json({ ok: true });
+    }
+
+    const jobCode = raw.replace(/^CLAIM#/i, "").trim();
+    if (!jobCode) {
+      return res.status(200).json({ ok: true });
+    }
+
+    const { rows: jobRows } = await pool.query(
+      `SELECT * FROM jobs WHERE job_code = $1`,
+      [jobCode]
+    );
+    if (jobRows.length === 0) {
+      return res.status(200).json({ ok: true });
+    }
+
+    const job = jobRows[0];
+    const normFrom = normalizeDestinationMsisdn(String(sourcePhoneNumber));
+    if (!normFrom) {
+      return res.status(200).json({ ok: true });
+    }
+
+    const { rows: lmRows } = await pool.query(
+      `SELECT id, phone FROM locksmiths
+       WHERE regexp_replace(regexp_replace(COALESCE(phone,''), '[^0-9]', '', 'g'), '^0', '27') = $1`,
+      [normFrom]
+    );
+    const claimer = lmRows[0];
+    const notifiedIds = Array.isArray(job.notified_ids) ? job.notified_ids : [];
+
+    if (String(job.status).toLowerCase() !== "dispatched") {
+      await sendJobTaken(sourcePhoneNumber, job.job_code);
+      return res.status(200).json({ ok: true });
+    }
+
+    if (!claimer || !notifiedIds.includes(claimer.id)) {
+      await sendJobTaken(sourcePhoneNumber, job.job_code);
+      return res.status(200).json({ ok: true });
+    }
+
+    await pool.query(
+      `UPDATE jobs SET status = 'claimed', claimed_by = $1, claimed_at = NOW() WHERE id = $2`,
+      [normFrom, job.id]
+    );
+
+    await sendJobClaimed(sourcePhoneNumber, {
+      name: job.customer_name,
+      phone: job.customer_phone,
+      jobCode: job.job_code,
+    });
+
+    const { rows: otherPhones } = await pool.query(
+      `SELECT phone FROM locksmiths WHERE id = ANY($1::int[]) AND id <> $2`,
+      [notifiedIds, claimer.id]
+    );
+    for (const row of otherPhones) {
+      if (row.phone) {
+        await sendJobTaken(row.phone, job.job_code);
+      }
+    }
+  } catch (e) {
+    console.error("[POST /api/sms/incoming]", e);
+  }
+  return res.status(200).json({ ok: true });
+});
+
+// ─── Cron: subscription expiry ───────────────────────────────────────────────
+app.get("/api/cron/check-expiry", async (req, res) => {
+  try {
+    const secret = process.env.CRON_SECRET?.trim();
+    if (!secret || req.headers["x-cron-secret"] !== secret) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+
+    const appUrl = (
+      process.env.NEXT_PUBLIC_APP_URL || "https://vula24.co.za"
+    ).replace(/\/$/, "");
+    const bank = getBankDetails();
+    let warned = 0;
+    let expired = 0;
+
+    const { rows: warnRows } = await pool.query(
+      `SELECT id, phone, customer_code, tier, expiry_date
+       FROM locksmiths
+       WHERE LOWER(status) = 'active'
+         AND expiry_date IS NOT NULL
+         AND expiry_date > NOW()
+         AND expiry_date <= NOW() + INTERVAL '3 days'`
+    );
+
+    for (const lm of warnRows) {
+      const d = new Date(lm.expiry_date);
+      const days = Math.max(
+        1,
+        Math.ceil((d.getTime() - Date.now()) / 86400000)
+      );
+      const amt = TIER_AMOUNTS[lm.tier] ?? TIER_AMOUNTS.Starter;
+      const msg =
+        `Vula24: Your subscription expires in ${days} days.\n` +
+        `Renew using reference: ${lm.customer_code}\n` +
+        `Deposit R${amt} to:\n` +
+        `Bank: ${bank.bankName}\n` +
+        `Acc: ${bank.accountNumber}\n` +
+        `Ref: ${lm.customer_code}\n` +
+        `Upload proof: ${appUrl}/locksmith/payment`;
+      await sendSms(lm.phone, msg, `expiry-warn-${lm.id}`);
+      warned += 1;
+    }
+
+    const { rows: expRows } = await pool.query(
+      `SELECT id, phone, customer_code, tier FROM locksmiths
+       WHERE LOWER(status) = 'active'
+         AND expiry_date IS NOT NULL
+         AND expiry_date < NOW()`
+    );
+
+    for (const lm of expRows) {
+      await pool.query(`UPDATE locksmiths SET status = 'expired' WHERE id = $1`, [
+        lm.id,
+      ]);
+      const amt = TIER_AMOUNTS[lm.tier] ?? TIER_AMOUNTS.Starter;
+      const msg =
+        `Vula24: Your subscription has expired.\n` +
+        `To reactivate deposit R${amt}\n` +
+        `Reference: ${lm.customer_code}\n` +
+        `Upload proof: ${appUrl}/locksmith/payment`;
+      await sendSms(lm.phone, msg, `expiry-done-${lm.id}`);
+      expired += 1;
+    }
+
+    return res.status(200).json({
+      warned,
+      expired,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (e) {
+    console.error("[GET /api/cron/check-expiry]", e);
+    return res.status(500).json({ error: "Cron failed." });
+  }
+});
+
+// ─── Admin: Jobs ─────────────────────────────────────────────────────────────
+app.get("/api/admin/jobs", async (_req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT * FROM jobs ORDER BY created_at DESC LIMIT 200`
+    );
+    return res.status(200).json({ ok: true, jobs: rows });
+  } catch (e) {
+    console.error("[GET /api/admin/jobs]", e);
+    return res.status(500).json({ error: "Could not load jobs." });
+  }
+});
+
+app.post("/api/admin/jobs/:id/redispatch", async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isFinite(id)) {
+      return res.status(400).json({ error: "Invalid id" });
+    }
+    const { rows } = await pool.query(`SELECT status FROM jobs WHERE id = $1`, [
+      id,
+    ]);
+    if (rows.length === 0) {
+      return res.status(404).json({ error: "Not found" });
+    }
+    const st = String(rows[0].status || "").toLowerCase();
+    if (st === "claimed" || st === "completed") {
+      return res.status(400).json({ error: "Job cannot be redispatched." });
+    }
+    await dispatchJob(pool, id);
+    return res.status(200).json({ ok: true, message: "Job redispatched" });
+  } catch (e) {
+    console.error("[POST /api/admin/jobs/:id/redispatch]", e);
+    return res.status(500).json({ error: "Redispatch failed." });
   }
 });
 
