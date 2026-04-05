@@ -452,18 +452,35 @@ app.post(
   },
   async (req, res) => {
     try {
-      const { locksmithId } = req.body || {};
+      const { locksmithId, customer_code } = req.body || {};
+      const codeRaw =
+        typeof customer_code === "string" ? customer_code.trim() : "";
 
       if (!req.file) {
         return res.status(400).json({ error: "file is required" });
       }
-      if (!locksmithId) {
-        return res.status(400).json({ error: "locksmithId is required" });
+
+      let lookupId = locksmithId;
+      if (!lookupId && codeRaw) {
+        const found = await pool.query(
+          "SELECT id FROM locksmiths WHERE customer_code = $1",
+          [codeRaw]
+        );
+        if (found.rows.length > 0) {
+          lookupId = found.rows[0].id;
+        }
+      }
+
+      if (!lookupId) {
+        return res.status(400).json({
+          error:
+            "customer_code or locksmithId is required (form field customer_code from the app).",
+        });
       }
 
       const { rows } = await pool.query(
         "SELECT * FROM locksmiths WHERE id = $1",
-        [locksmithId]
+        [lookupId]
       );
       if (rows.length === 0) {
         return res.status(404).json({ error: "Locksmith not found" });
@@ -482,7 +499,7 @@ app.post(
 
       await pool.query(
         "UPDATE locksmiths SET proof_of_payment = $1 WHERE id = $2",
-        [uploadResult.url, locksmithId]
+        [uploadResult.url, lookupId]
       );
 
       return res.status(200).json({
