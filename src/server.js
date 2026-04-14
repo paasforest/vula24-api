@@ -734,6 +734,22 @@ app.post("/api/admin/approve/:id", async (req, res) => {
       console.error("[approve] SMS error (non-fatal):", smsErr.message);
     }
 
+    if (!smsSent) {
+      const adminPhone = process.env.ADMIN_PHONE?.trim();
+      if (adminPhone) {
+        try {
+          const who = [locksmith.name, locksmith.phone].filter(Boolean).join(" · ");
+          await sendSms(
+            adminPhone,
+            `Vula24 admin: approval SMS failed for ${who || "locksmith"}. Code ${customerCode}. Check SMSPortal/credits.`,
+            `admin-approve-fail-${id}`
+          );
+        } catch (adminSmsErr) {
+          console.error("[approve] admin alert SMS failed:", adminSmsErr.message);
+        }
+      }
+    }
+
     return res.status(200).json({
       ok: true,
       customer_code: customerCode,
