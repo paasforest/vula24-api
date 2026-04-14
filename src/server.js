@@ -11,12 +11,19 @@ const { generateCustomerCode } = require("../lib/customer-code");
 const { uploadProofOfPayment } = require("../lib/cloudinary");
 const {
   sendSms,
+  sendLaunchApprovalSms,
+  sendLaunchActivateSms,
   sendActivationSms,
   isSmsConfigured,
   sendJobClaimed,
   sendJobTaken,
   normalizeDestinationMsisdn,
 } = require("../lib/sms");
+const {
+  isLaunchFree,
+  foundingFreeMonths,
+  firstBillingMonthLabel,
+} = require("../lib/launch");
 const { dispatchJob } = require("../lib/matching");
 const {
   signLocksmithToken,
@@ -62,8 +69,58 @@ function getBankDetails() {
   };
 }
 
-// Tier pricing
+// Tier pricing (paid mode). With LAUNCH_FREE_PLATFORM, admin flows use R0 expected and founding SMS.
 const TIER_AMOUNTS = { Starter: 499, Pro: 899 };
+
+function expectedSubscriptionAmountForTier(tierRaw) {
+  if (isLaunchFree()) return 0;
+  const tierKey =
+    String(tierRaw || "Starter").trim().toLowerCase() === "pro"
+      ? "Pro"
+      : "Starter";
+  return (
+    TIER_AMOUNTS[tierRaw] ?? TIER_AMOUNTS[tierKey] ?? TIER_AMOUNTS.Starter
+  );
+}
+
+function expiryWarningSmsBody(lm, days, appUrl, bank) {
+  if (isLaunchFree()) {
+    return (
+      `Vula24: Your founding access period ends in ${days} days.\n` +
+      `Code: ${lm.customer_code}\n` +
+      `No platform fee during founding — we will give notice before paid plans (${firstBillingMonthLabel()}).\n` +
+      `Portal: ${appUrl}/locksmith/dashboard`
+    );
+  }
+  const amt = TIER_AMOUNTS[lm.tier] ?? TIER_AMOUNTS.Starter;
+  return (
+    `Vula24: Your subscription expires in ${days} days.\n` +
+    `Renew using reference: ${lm.customer_code}\n` +
+    `Deposit R${amt} to:\n` +
+    `Bank: ${bank.bankName}\n` +
+    `Acc: ${bank.accountNumber}\n` +
+    `Ref: ${lm.customer_code}\n` +
+    `Upload proof: ${appUrl}/locksmith/payment`
+  );
+}
+
+function expiryExpiredSmsBody(lm, appUrl) {
+  if (isLaunchFree()) {
+    return (
+      `Vula24: Your founding access period has ended.\n` +
+      `Ref: ${lm.customer_code}\n` +
+      `We will contact you about next steps before any subscription fee (${firstBillingMonthLabel()}).\n` +
+      `Portal: ${appUrl}/locksmith/dashboard`
+    );
+  }
+  const amt = TIER_AMOUNTS[lm.tier] ?? TIER_AMOUNTS.Starter;
+  return (
+    `Vula24: Your subscription has expired.\n` +
+    `To reactivate deposit R${amt}\n` +
+    `Reference: ${lm.customer_code}\n` +
+    `Upload proof: ${appUrl}/locksmith/payment`
+  );
+}
 
 const LOCKSMITH_SERVICES = [
   { value: "car_lockout", label: "Car lockout", urgency: "emergency" },
@@ -642,7 +699,6 @@ app.post("/api/admin/approve/:id", async (req, res) => {
     const locksmith = rows[0];
     const province = locksmith.province || "XX";
     const customerCode = generateCustomerCode(province, locksmith.id);
-    const amount = TIER_AMOUNTS[tier];
 
     await pool.query(
       `UPDATE locksmiths
@@ -658,13 +714,22 @@ app.post("/api/admin/approve/:id", async (req, res) => {
     const bankDetails = getBankDetails();
     let smsSent = false;
     try {
-      smsSent = await sendActivationSms(
-        locksmith.phone,
-        customerCode,
-        tier,
-        amount,
-        bankDetails
-      );
+      if (isLaunchFree()) {
+        smsSent = await sendLaunchApprovalSms(
+          locksmith.phone,
+          customerCode,
+          tier
+        );
+      } else {
+        const amount = expectedSubscriptionAmountForTier(tier);
+        smsSent = await sendActivationSms(
+          locksmith.phone,
+          customerCode,
+          tier,
+          amount,
+          bankDetails
+        );
+      }
     } catch (smsErr) {
       console.error("[approve] SMS error (non-fatal):", smsErr.message);
     }
@@ -701,16 +766,10 @@ app.post("/api/admin/activate/:id", async (req, res) => {
       });
     }
 
-    const tierKey =
-      String(locksmith.tier || "Starter").trim().toLowerCase() === "pro"
-        ? "Pro"
-        : "Starter";
-    const expectedAmount =
-      TIER_AMOUNTS[locksmith.tier] ??
-      TIER_AMOUNTS[tierKey] ??
-      TIER_AMOUNTS.Starter;
+    const expectedAmount = expectedSubscriptionAmountForTier(locksmith.tier);
     const amountPaid = parseFloat(amountPaidRaw) || 0;
-    const amountMatches = amountPaid === expectedAmount;
+    const amountMatches =
+      isLaunchFree() || amountPaid === expectedAmount;
 
     const proofVal = proofUrl || locksmith.proof_of_payment;
     const paymentRef =
@@ -722,26 +781,50 @@ app.post("/api/admin/activate/:id", async (req, res) => {
         ? activatedBy.trim()
         : "admin";
 
-    await pool.query(
-      `UPDATE locksmiths
-       SET status = 'active',
-           activation_date = NOW(),
-           expiry_date = NOW() + INTERVAL '30 days',
-           proof_of_payment = $1,
-           amount_paid = $2,
-           payment_date = NOW(),
-           payment_reference = $3,
-           approved_by = $4
-       WHERE id = $5`,
-      [proofVal, amountPaid, paymentRef, approvedByVal, id]
-    );
+    if (isLaunchFree()) {
+      const months = foundingFreeMonths();
+      await pool.query(
+        `UPDATE locksmiths
+         SET status = 'active',
+             activation_date = NOW(),
+             expiry_date = NOW() + $6::int * INTERVAL '1 month',
+             proof_of_payment = $1,
+             amount_paid = $2,
+             payment_date = NOW(),
+             payment_reference = $3,
+             approved_by = $4
+         WHERE id = $5`,
+        [proofVal, amountPaid, paymentRef, approvedByVal, id, months]
+      );
+    } else {
+      await pool.query(
+        `UPDATE locksmiths
+         SET status = 'active',
+             activation_date = NOW(),
+             expiry_date = NOW() + INTERVAL '30 days',
+             proof_of_payment = $1,
+             amount_paid = $2,
+             payment_date = NOW(),
+             payment_reference = $3,
+             approved_by = $4
+         WHERE id = $5`,
+        [proofVal, amountPaid, paymentRef, approvedByVal, id]
+      );
+    }
 
     try {
-      await sendSms(
-        locksmith.phone,
-        "Your Vula24 account is now active! You will receive job notifications via SMS.",
-        `activate-${locksmith.customer_code}`
-      );
+      if (isLaunchFree()) {
+        await sendLaunchActivateSms(
+          locksmith.phone,
+          String(locksmith.customer_code || "").trim() || `id-${id}`
+        );
+      } else {
+        await sendSms(
+          locksmith.phone,
+          "Your Vula24 account is now active! You will receive job notifications via SMS.",
+          `activate-${locksmith.customer_code}`
+        );
+      }
     } catch (smsErr) {
       console.error("[activate] SMS error (non-fatal):", smsErr.message);
     }
@@ -752,9 +835,10 @@ app.post("/api/admin/activate/:id", async (req, res) => {
       amountMatches,
       expectedAmount,
       amountPaid,
-      warning: !amountMatches
-        ? `Amount paid (R${amountPaid}) does not match expected (R${expectedAmount})`
-        : null,
+      warning:
+        !isLaunchFree() && !amountMatches
+          ? `Amount paid (R${amountPaid}) does not match expected (R${expectedAmount})`
+          : null,
     });
   } catch (e) {
     console.error("[POST /api/admin/activate/:id]", e);
@@ -952,7 +1036,9 @@ app.get("/api/admin/finance", async (_req, res) => {
     const activeCount = activeCountRows[0]?.c ?? 0;
     const starterCount = starterCountRows[0]?.c ?? 0;
     const proCount = proCountRows[0]?.c ?? 0;
-    const projectedNextMonth = starterCount * 499 + proCount * 899;
+    const projectedNextMonth = isLaunchFree()
+      ? 0
+      : starterCount * 499 + proCount * 899;
 
     const { rows: payRows } = await pool.query(
       `SELECT
@@ -1256,15 +1342,7 @@ app.get("/api/cron/check-expiry", async (req, res) => {
         1,
         Math.ceil((d.getTime() - Date.now()) / 86400000)
       );
-      const amt = TIER_AMOUNTS[lm.tier] ?? TIER_AMOUNTS.Starter;
-      const msg =
-        `Vula24: Your subscription expires in ${days} days.\n` +
-        `Renew using reference: ${lm.customer_code}\n` +
-        `Deposit R${amt} to:\n` +
-        `Bank: ${bank.bankName}\n` +
-        `Acc: ${bank.accountNumber}\n` +
-        `Ref: ${lm.customer_code}\n` +
-        `Upload proof: ${appUrl}/locksmith/payment`;
+      const msg = expiryWarningSmsBody(lm, days, appUrl, bank);
       await sendSms(lm.phone, msg, `expiry-warn-${lm.id}`);
       warned += 1;
     }
@@ -1280,12 +1358,7 @@ app.get("/api/cron/check-expiry", async (req, res) => {
       await pool.query(`UPDATE locksmiths SET status = 'expired' WHERE id = $1`, [
         lm.id,
       ]);
-      const amt = TIER_AMOUNTS[lm.tier] ?? TIER_AMOUNTS.Starter;
-      const msg =
-        `Vula24: Your subscription has expired.\n` +
-        `To reactivate deposit R${amt}\n` +
-        `Reference: ${lm.customer_code}\n` +
-        `Upload proof: ${appUrl}/locksmith/payment`;
+      const msg = expiryExpiredSmsBody(lm, appUrl);
       await sendSms(lm.phone, msg, `expiry-done-${lm.id}`);
       expired += 1;
     }
@@ -1351,6 +1424,12 @@ async function main() {
 
   await ensureTables();
 
+  if (isLaunchFree()) {
+    console.log(
+      `[vula24-api] LAUNCH_FREE_PLATFORM: founding ${foundingFreeMonths()} mo; first billing ${firstBillingMonthLabel()}`
+    );
+  }
+
   cron.schedule(
     "0 8 * * *",
     async () => {
@@ -1378,15 +1457,7 @@ async function main() {
             1,
             Math.ceil((d.getTime() - Date.now()) / 86400000)
           );
-          const amt = TIER_AMOUNTS[lm.tier] ?? TIER_AMOUNTS.Starter;
-          const msg =
-            `Vula24: Your subscription expires in ${days} days.\n` +
-            `Renew using reference: ${lm.customer_code}\n` +
-            `Deposit R${amt} to:\n` +
-            `Bank: ${bank.bankName}\n` +
-            `Acc: ${bank.accountNumber}\n` +
-            `Ref: ${lm.customer_code}\n` +
-            `Upload proof: ${appUrl}/locksmith/payment`;
+          const msg = expiryWarningSmsBody(lm, days, appUrl, bank);
           await sendSms(lm.phone, msg, `cron-warn-${lm.id}`);
           warned++;
         }
@@ -1403,12 +1474,7 @@ async function main() {
           await pool.query(`UPDATE locksmiths SET status = 'expired' WHERE id = $1`, [
             lm.id,
           ]);
-          const amt = TIER_AMOUNTS[lm.tier] ?? TIER_AMOUNTS.Starter;
-          const msg =
-            `Vula24: Your subscription has expired.\n` +
-            `To reactivate deposit R${amt}\n` +
-            `Reference: ${lm.customer_code}\n` +
-            `Upload proof: ${appUrl}/locksmith/payment`;
+          const msg = expiryExpiredSmsBody(lm, appUrl);
           await sendSms(lm.phone, msg, `cron-exp-${lm.id}`);
           expired++;
         }
