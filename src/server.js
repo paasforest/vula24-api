@@ -32,6 +32,50 @@ const {
 const { findLocksmithByEmailOrPhone } = require("../lib/locksmith-lookup");
 const { sendPasswordResetEmail } = require("../lib/email-resend");
 
+const SERVICE_LABELS = {
+  car_lockout: "Car lockout",
+  house_lockout: "House lockout",
+  office_lockout: "Office lockout",
+  lost_car_key: "Lost car key replacement",
+  car_key_duplication: "Car key duplication",
+  car_key_programming: "Car key programming",
+  broken_key_extraction: "Broken key extraction",
+  house_key_replacement: "House key replacement",
+  house_key_duplication: "House key duplication",
+  lock_repair: "Lock repair",
+  lock_replacement: "Lock replacement",
+  lock_upgrade: "Lock upgrade",
+  safe_opening: "Safe opening",
+  gate_motor: "Gate motor repair",
+  access_control: "Access control",
+  padlock_removal: "Padlock removal",
+  garage_door: "Garage door",
+  ignition_repair: "Ignition repair",
+};
+
+const URGENCY_LABELS = {
+  emergency: "EMERGENCY",
+  urgent: "URGENT",
+  flexible: "Flexible",
+};
+
+const URGENCY_EMOJI = {
+  emergency: "🔴",
+  urgent: "🟡",
+  flexible: "🟢",
+};
+
+function getServiceLabel(service) {
+  return SERVICE_LABELS[service] || service;
+}
+
+function getUrgencyLabel(urgency) {
+  const label =
+    URGENCY_LABELS[urgency] || urgency.toUpperCase();
+  const emoji = URGENCY_EMOJI[urgency] || "";
+  return `${emoji} ${label}`;
+}
+
 const PORT = Number(process.env.PORT) || 3000;
 const NODE_ENV = process.env.NODE_ENV || "development";
 
@@ -179,13 +223,27 @@ async function createJobAndDispatch(pool, payload) {
     customerPhone,
     suburb,
     province,
+    address,
+    city,
+    notes,
   } = payload;
   const jobCode = generateJobCode();
   const { rows } = await pool.query(
-    `INSERT INTO jobs (job_code, service, urgency, customer_name, customer_phone, suburb, province, status)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending')
+    `INSERT INTO jobs (job_code, service, urgency, customer_name, customer_phone, suburb, province, status, address, city, notes)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8, $9, $10)
      RETURNING id`,
-    [jobCode, service, urgency, customerName, customerPhone, suburb, province]
+    [
+      jobCode,
+      service,
+      urgency,
+      customerName,
+      customerPhone,
+      suburb,
+      province,
+      address,
+      city,
+      notes,
+    ]
   );
   const jobId = rows[0].id;
   await dispatchJob(pool, jobId);
@@ -287,6 +345,11 @@ async function ensureTables() {
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
   `);
+
+  await pool.query(`ALTER TABLE jobs ADD COLUMN IF NOT EXISTS address TEXT;`);
+  await pool.query(`ALTER TABLE jobs ADD COLUMN IF NOT EXISTS city VARCHAR(100);`);
+  await pool.query(`ALTER TABLE jobs ADD COLUMN IF NOT EXISTS notes TEXT;`);
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS sms_logs (
       id SERIAL PRIMARY KEY,
@@ -376,6 +439,9 @@ app.post("/api/jobs/website/request", async (req, res) => {
         customerPhone: phone.trim(),
         suburb: suburb.trim(),
         province,
+        address: req.body.address || null,
+        city: req.body.city || null,
+        notes: req.body.notes || null,
       });
       jobCode = job.jobCode;
     } catch (jobErr) {
@@ -403,6 +469,9 @@ app.post("/api/jobs/create", async (req, res) => {
       customerPhone,
       suburb,
       province,
+      address,
+      city,
+      notes,
     } = req.body || {};
 
     if (!service || typeof service !== "string" || !service.trim()) {
@@ -431,6 +500,9 @@ app.post("/api/jobs/create", async (req, res) => {
       customerPhone: customerPhone.trim(),
       suburb: suburb.trim(),
       province: province.trim().toUpperCase().slice(0, 5),
+      address: address || null,
+      city: city || null,
+      notes: notes || null,
     });
 
     return res.status(201).json({ ok: true, jobCode });
@@ -1311,6 +1383,8 @@ app.post("/api/sms/incoming", async (req, res) => {
       name: job.customer_name,
       phone: job.customer_phone,
       jobCode: job.job_code,
+      address: job.address || null,
+      suburb: job.suburb || null,
     });
 
     const { rows: otherPhones } = await pool.query(
